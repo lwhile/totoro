@@ -2,20 +2,34 @@ package totoro
 
 import (
 	"context"
-	"errors"
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/core/types"
 	"math/big"
 )
 
-var ErrNotAvailableClientFound = errors.New("not available client found")
-
-func (e *EthClient) ChainID(ctx context.Context) (*big.Int, error) {
-	for i := 0; i < len(e.rpcList); i++ {
-		cli := e.getNextAvailableClient()
-		if res, err := cli.ChainID(ctx); err != nil {
-			continue
-		} else {
-			return res, nil
-		}
+func (c *Client) ChainID(ctx context.Context) (*big.Int, error) {
+	cli, idx := c.getAvailableEthClient(len(c.rpcList))
+	res, err := cli.ChainID(ctx)
+	if err != nil {
+		c.saveEthCliErr(idx, err)
 	}
-	return nil, ErrNotAvailableClientFound
+	return res, err
+}
+
+func (c *Client) BlockNumber(ctx context.Context) (uint64, error) {
+	cli, idx := c.getAvailableEthClient(len(c.rpcList))
+	res, err := cli.BlockNumber(ctx)
+	if err != nil {
+		c.saveEthCliErr(idx, err)
+	}
+	return res, err
+}
+
+func (c *Client) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error) {
+	cli, idx := c.getAvailableEthClient(len(c.rpcList))
+	res, err := cli.FilterLogs(ctx, q)
+	if err != nil {
+		c.saveEthCliErr(idx, err)
+	}
+	return res, err
 }
