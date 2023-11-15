@@ -7,6 +7,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/sirupsen/logrus"
 	"math/big"
 	"time"
 )
@@ -27,6 +28,7 @@ type EventSubscriber struct {
 	updateCh     chan struct{}
 	contracts    map[common.Address]struct{}
 	topics       map[string]struct{}
+	logger       *logrus.Entry
 }
 
 func NewEventSubscriber(ctx context.Context, rpcs []string) (*EventSubscriber, error) {
@@ -81,6 +83,10 @@ func (es *EventSubscriber) updateBlockNumLoop() {
 	}
 }
 
+func (es *EventSubscriber) SetLogger(entry *logrus.Entry) {
+	es.logger = entry
+}
+
 func (es *EventSubscriber) Subscribe(ch chan types.Log) {
 	es.updateCh = make(chan struct{})
 	for {
@@ -91,7 +97,10 @@ func (es *EventSubscriber) Subscribe(ch chan types.Log) {
 					logs []types.Log
 					err  error
 				)
-				if logs, err = es.ethClis[0].FilterLogs(es.ctx, es.getEthereumQueryFilter()); err != nil {
+				if logs, err = es.FilterLogs(es.ctx, es.getEthereumQueryFilter()); err != nil {
+					if es.logger != nil {
+						es.logger.Errorf("filter logs failed, err: %v", err)
+					}
 					continue
 				}
 				for _, log := range logs {
@@ -145,9 +154,9 @@ func (es *EventSubscriber) BlockNumber() (uint64, error) {
 	return 0, fmt.Errorf("all eth clients are down")
 }
 
-func (es *EventSubscriber) FilterLogs() ([]types.Log, error) {
+func (es *EventSubscriber) FilterLogs(ctx context.Context, filter ethereum.FilterQuery) ([]types.Log, error) {
 	for _, cli := range es.ethClis {
-		if logs, err := cli.FilterLogs(es.ctx, es.getEthereumQueryFilter()); err != nil {
+		if logs, err := cli.FilterLogs(ctx, filter); err != nil {
 			continue
 		} else {
 			return logs, nil
