@@ -16,10 +16,9 @@ const (
 	defaultBlockUpdateInternal = time.Second * 30
 )
 
-// EventSubscriber subscribe event by http but no websocket
-type EventSubscriber struct {
+// EthereumClient represents a ethereum client
+type EthereumClient struct {
 	ctx          context.Context
-	currIdx      int
 	rpcs         []string
 	ethClis      []*ethclient.Client
 	initialBlock uint64
@@ -31,8 +30,8 @@ type EventSubscriber struct {
 	logger       *logrus.Entry
 }
 
-func NewEventSubscriber(ctx context.Context, rpcs []string) (*EventSubscriber, error) {
-	sub := &EventSubscriber{
+func NewEthereumClient(ctx context.Context, rpcs []string) (*EthereumClient, error) {
+	sub := &EthereumClient{
 		ctx:       ctx,
 		rpcs:      rpcs,
 		updateCh:  nil,
@@ -61,7 +60,7 @@ func NewEventSubscriber(ctx context.Context, rpcs []string) (*EventSubscriber, e
 	return sub, nil
 }
 
-func (es *EventSubscriber) updateBlockNumLoop() {
+func (ec *EthereumClient) updateBlockNumLoop() {
 	ticker := time.NewTicker(defaultBlockUpdateInternal)
 	for {
 		select {
@@ -70,82 +69,82 @@ func (es *EventSubscriber) updateBlockNumLoop() {
 				blockNum uint64
 				err      error
 			)
-			if blockNum, err = es.BlockNumber(); err != nil {
+			if blockNum, err = ec.BlockNumber(); err != nil {
 				continue
 			}
-			es.currBlock = blockNum
-			if es.updateCh != nil {
-				es.updateCh <- struct{}{}
+			ec.currBlock = blockNum
+			if ec.updateCh != nil {
+				ec.updateCh <- struct{}{}
 			}
-		case <-es.ctx.Done():
+		case <-ec.ctx.Done():
 			return
 		}
 	}
 }
 
-func (es *EventSubscriber) SetLogger(entry *logrus.Entry) {
-	es.logger = entry
+func (ec *EthereumClient) SetLogger(entry *logrus.Entry) {
+	ec.logger = entry
 }
 
-func (es *EventSubscriber) Subscribe(ch chan types.Log) {
-	es.updateCh = make(chan struct{})
+func (ec *EthereumClient) Subscribe(ch chan types.Log) {
+	ec.updateCh = make(chan struct{})
 	for {
 		select {
-		case <-es.updateCh:
-			if es.currBlock > es.prevBlock {
+		case <-ec.updateCh:
+			if ec.currBlock > ec.prevBlock {
 				var (
 					logs []types.Log
 					err  error
 				)
-				if logs, err = es.FilterLogs(es.ctx, es.getEthereumQueryFilter()); err != nil {
-					if es.logger != nil {
-						es.logger.Errorf("filter logs failed, err: %v", err)
+				if logs, err = ec.FilterLogs(ec.ctx, ec.getEthereumQueryFilter()); err != nil {
+					if ec.logger != nil {
+						ec.logger.Errorf("filter logs failed, err: %v", err)
 					}
 					continue
 				}
 				for _, log := range logs {
 					ch <- log
 				}
-				es.prevBlock = es.currBlock
+				ec.prevBlock = ec.currBlock
 			}
-		case <-es.ctx.Done():
+		case <-ec.ctx.Done():
 			return
 		}
 	}
 }
 
-func (es *EventSubscriber) AddSubscribeContract(contracts ...common.Address) {
+func (ec *EthereumClient) AddSubscribeContract(contracts ...common.Address) {
 	for _, contract := range contracts {
-		es.contracts[contract] = struct{}{}
+		ec.contracts[contract] = struct{}{}
 	}
 }
 
-func (es *EventSubscriber) AddSubscribeTopic(topics ...string) {
+func (ec *EthereumClient) AddSubscribeTopic(topics ...string) {
 	for _, topic := range topics {
-		es.topics[topic] = struct{}{}
+		ec.topics[topic] = struct{}{}
 	}
 }
 
-func (es *EventSubscriber) getEthereumQueryFilter() ethereum.FilterQuery {
-	addresses := make([]common.Address, 0, len(es.contracts))
-	for addr := range es.contracts {
+func (ec *EthereumClient) getEthereumQueryFilter() ethereum.FilterQuery {
+	addresses := make([]common.Address, 0, len(ec.contracts))
+	for addr := range ec.contracts {
 		addresses = append(addresses, addr)
 	}
-	topics := make([]common.Hash, 0, len(es.topics))
-	for topic := range es.topics {
+	topics := make([]common.Hash, 0, len(ec.topics))
+	for topic := range ec.topics {
 		topics = append(topics, common.HexToHash(topic))
 	}
 	return ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(es.prevBlock - 1)),
-		ToBlock:   big.NewInt(int64(es.currBlock)),
+		FromBlock: big.NewInt(int64(ec.prevBlock - 1)),
+		ToBlock:   big.NewInt(int64(ec.currBlock)),
 		Addresses: addresses,
 		Topics:    [][]common.Hash{topics},
 	}
 }
 
-func (es *EventSubscriber) BlockNumber() (uint64, error) {
-	for _, cli := range es.ethClis {
-		if num, err := cli.BlockNumber(es.ctx); err != nil || num == 0 {
+func (ec *EthereumClient) BlockNumber() (uint64, error) {
+	for _, cli := range ec.ethClis {
+		if num, err := cli.BlockNumber(ec.ctx); err != nil || num == 0 {
 			continue
 		} else {
 			return num, nil
@@ -154,12 +153,67 @@ func (es *EventSubscriber) BlockNumber() (uint64, error) {
 	return 0, fmt.Errorf("all eth clients are down")
 }
 
-func (es *EventSubscriber) FilterLogs(ctx context.Context, filter ethereum.FilterQuery) ([]types.Log, error) {
-	for _, cli := range es.ethClis {
+func (ec *EthereumClient) FilterLogs(ctx context.Context, filter ethereum.FilterQuery) ([]types.Log, error) {
+	for _, cli := range ec.ethClis {
 		if logs, err := cli.FilterLogs(ctx, filter); err != nil {
 			continue
 		} else {
 			return logs, nil
+		}
+	}
+	return nil, fmt.Errorf("all eth clients are down")
+}
+
+func (ec *EthereumClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
+	for _, cli := range ec.ethClis {
+		if receipt, err := cli.TransactionReceipt(ctx, txHash); err != nil {
+			continue
+		} else {
+			return receipt, nil
+		}
+	}
+	return nil, fmt.Errorf("all eth clients are down")
+}
+
+func (ec *EthereumClient) BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error) {
+	for _, cli := range ec.ethClis {
+		if block, err := cli.BlockByNumber(ctx, number); err != nil {
+			continue
+		} else {
+			return block, nil
+		}
+	}
+	return nil, fmt.Errorf("all eth clients are down")
+}
+
+func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Hash) (tx *types.Transaction, isPending bool, err error) {
+	for _, cli := range ec.ethClis {
+		if tx, isPending, err = cli.TransactionByHash(ctx, hash); err != nil {
+			continue
+		} else {
+			return tx, isPending, nil
+		}
+	}
+	return nil, false, fmt.Errorf("all eth clients are down")
+}
+
+func (ec *EthereumClient) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
+	for _, cli := range ec.ethClis {
+		if price, err := cli.SuggestGasPrice(ctx); err != nil {
+			continue
+		} else {
+			return price, nil
+		}
+	}
+	return nil, fmt.Errorf("all eth clients are down")
+}
+
+func (ec *EthereumClient) GetAvailableRPCCli() (*ethclient.Client, error) {
+	for _, cli := range ec.ethClis {
+		if _, err := cli.BlockNumber(ec.ctx); err != nil {
+			continue
+		} else {
+			return cli, nil
 		}
 	}
 	return nil, fmt.Errorf("all eth clients are down")
