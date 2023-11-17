@@ -144,7 +144,7 @@ func (ec *EthereumClient) getEthereumQueryFilter() ethereum.FilterQuery {
 func (ec *EthereumClient) BlockNumber() (uint64, error) {
 	for _, cli := range ec.ethClis {
 		if num, err := cli.BlockNumber(ec.ctx); err != nil || num == 0 {
-			ec.logger.Errorf("filter logs failed, err: %v", err)
+			ec.logError(err)
 			continue
 		} else {
 			return num, nil
@@ -156,7 +156,7 @@ func (ec *EthereumClient) BlockNumber() (uint64, error) {
 func (ec *EthereumClient) FilterLogs(ctx context.Context, filter ethereum.FilterQuery) ([]types.Log, error) {
 	for _, cli := range ec.ethClis {
 		if logs, err := cli.FilterLogs(ctx, filter); err != nil {
-			ec.logger.Errorf("filter logs failed, err: %v", err)
+			ec.logError(err)
 			continue
 		} else {
 			return logs, nil
@@ -168,7 +168,7 @@ func (ec *EthereumClient) FilterLogs(ctx context.Context, filter ethereum.Filter
 func (ec *EthereumClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
 	for _, cli := range ec.ethClis {
 		if receipt, err := cli.TransactionReceipt(ctx, txHash); err != nil {
-			ec.logger.Errorf("filter logs failed, err: %v", err)
+			ec.logError(err)
 			continue
 		} else {
 			return receipt, nil
@@ -180,7 +180,7 @@ func (ec *EthereumClient) TransactionReceipt(ctx context.Context, txHash common.
 func (ec *EthereumClient) BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error) {
 	for _, cli := range ec.ethClis {
 		if block, err := cli.BlockByNumber(ctx, number); err != nil {
-			ec.logger.Errorf("filter logs failed, err: %v", err)
+			ec.logError(err)
 			continue
 		} else {
 			return block, nil
@@ -192,7 +192,7 @@ func (ec *EthereumClient) BlockByNumber(ctx context.Context, number *big.Int) (*
 func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Hash) (tx *types.Transaction, isPending bool, err error) {
 	for _, cli := range ec.ethClis {
 		if tx, isPending, err = cli.TransactionByHash(ctx, hash); err != nil {
-			ec.logger.Errorf("filter logs failed, err: %v", err)
+			ec.logError(err)
 			continue
 		} else {
 			return tx, isPending, nil
@@ -204,7 +204,7 @@ func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Has
 func (ec *EthereumClient) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 	for _, cli := range ec.ethClis {
 		if price, err := cli.SuggestGasPrice(ctx); err != nil {
-			ec.logger.Errorf("filter logs failed, err: %v", err)
+			ec.logError(err)
 			continue
 		} else {
 			return price, nil
@@ -216,7 +216,7 @@ func (ec *EthereumClient) SuggestGasPrice(ctx context.Context) (*big.Int, error)
 func (ec *EthereumClient) GetAvailableRPCCli() (*ethclient.Client, error) {
 	for _, cli := range ec.ethClis {
 		if _, err := cli.BlockNumber(ec.ctx); err != nil {
-			ec.logger.Errorf("filter logs failed, err: %v", err)
+			ec.logError(err)
 			continue
 		} else {
 			return cli, nil
