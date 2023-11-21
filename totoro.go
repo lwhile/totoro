@@ -154,39 +154,45 @@ func (ec *EthereumClient) BlockNumber() (uint64, error) {
 }
 
 func (ec *EthereumClient) FilterLogs(ctx context.Context, filter ethereum.FilterQuery) ([]types.Log, error) {
+	var lastErr error
 	for _, cli := range ec.ethClis {
 		if logs, err := cli.FilterLogs(ctx, filter); err != nil {
+			lastErr = err
 			ec.logError(err)
 			continue
 		} else {
 			return logs, nil
 		}
 	}
-	return nil, fmt.Errorf("all eth clients are down")
+	return nil, fmt.Errorf("all eth clients are down:%w", lastErr)
 }
 
 func (ec *EthereumClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
+	var lastErr error
 	for _, cli := range ec.ethClis {
 		if receipt, err := cli.TransactionReceipt(ctx, txHash); err != nil {
+			lastErr = err
 			ec.logError(err)
 			continue
 		} else {
 			return receipt, nil
 		}
 	}
-	return nil, fmt.Errorf("all eth clients are down")
+	return nil, fmt.Errorf("all eth clients are down:%w", lastErr)
 }
 
 func (ec *EthereumClient) BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error) {
+	var lastErr error
 	for _, cli := range ec.ethClis {
 		if block, err := cli.BlockByNumber(ctx, number); err != nil {
+			lastErr = err
 			ec.logError(err)
 			continue
 		} else {
 			return block, nil
 		}
 	}
-	return nil, fmt.Errorf("all eth clients are down")
+	return nil, fmt.Errorf("all eth clients are down:%w", lastErr)
 }
 
 func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Hash) (tx *types.Transaction, isPending bool, err error) {
@@ -198,31 +204,35 @@ func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Has
 			return tx, isPending, nil
 		}
 	}
-	return nil, false, fmt.Errorf("all eth clients are down")
+	return nil, false, fmt.Errorf("all eth clients are down:%w", err)
 }
 
 func (ec *EthereumClient) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
+	var lastErr error
 	for _, cli := range ec.ethClis {
 		if price, err := cli.SuggestGasPrice(ctx); err != nil {
+			lastErr = err
 			ec.logError(err)
 			continue
 		} else {
 			return price, nil
 		}
 	}
-	return nil, fmt.Errorf("all eth clients are down")
+	return nil, fmt.Errorf("all eth clients are down:%w", lastErr)
 }
 
 func (ec *EthereumClient) GetAvailableRPCCli() (*ethclient.Client, error) {
+	var lastErr error
 	for _, cli := range ec.ethClis {
 		if _, err := cli.BlockNumber(ec.ctx); err != nil {
+			lastErr = err
 			ec.logError(err)
 			continue
 		} else {
 			return cli, nil
 		}
 	}
-	return nil, fmt.Errorf("all eth clients are down")
+	return nil, fmt.Errorf("all eth clients are down:%w", lastErr)
 }
 
 func (ec *EthereumClient) logError(err error) {
