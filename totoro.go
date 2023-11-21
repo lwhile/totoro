@@ -2,6 +2,7 @@ package totoro
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -236,7 +237,7 @@ func (ec *EthereumClient) GetAvailableRPCCli() (*ethclient.Client, error) {
 }
 
 func (ec *EthereumClient) logError(err error) {
-	if ec.logger != nil {
+	if ec.logger != nil && !errors.Is(err, ethereum.NotFound) {
 		ec.logger.Error(err)
 	}
 }
