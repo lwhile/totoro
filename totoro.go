@@ -143,9 +143,9 @@ func (ec *EthereumClient) getEthereumQueryFilter() ethereum.FilterQuery {
 }
 
 func (ec *EthereumClient) BlockNumber() (uint64, error) {
-	for _, cli := range ec.ethClis {
+	for i, cli := range ec.ethClis {
 		if num, err := cli.BlockNumber(ec.ctx); err != nil || num == 0 {
-			ec.logError(err)
+			ec.logError(err, ec.rpcs[i])
 			continue
 		} else {
 			return num, nil
@@ -156,10 +156,10 @@ func (ec *EthereumClient) BlockNumber() (uint64, error) {
 
 func (ec *EthereumClient) FilterLogs(ctx context.Context, filter ethereum.FilterQuery) ([]types.Log, error) {
 	var lastErr error
-	for _, cli := range ec.ethClis {
+	for i, cli := range ec.ethClis {
 		if logs, err := cli.FilterLogs(ctx, filter); err != nil {
 			lastErr = err
-			ec.logError(err)
+			ec.logError(err, ec.rpcs[i])
 			continue
 		} else {
 			return logs, nil
@@ -170,10 +170,10 @@ func (ec *EthereumClient) FilterLogs(ctx context.Context, filter ethereum.Filter
 
 func (ec *EthereumClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
 	var lastErr error
-	for _, cli := range ec.ethClis {
+	for i, cli := range ec.ethClis {
 		if receipt, err := cli.TransactionReceipt(ctx, txHash); err != nil {
 			lastErr = err
-			ec.logError(err)
+			ec.logError(err, ec.rpcs[i])
 			continue
 		} else {
 			return receipt, nil
@@ -184,10 +184,10 @@ func (ec *EthereumClient) TransactionReceipt(ctx context.Context, txHash common.
 
 func (ec *EthereumClient) BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error) {
 	var lastErr error
-	for _, cli := range ec.ethClis {
+	for i, cli := range ec.ethClis {
 		if block, err := cli.BlockByNumber(ctx, number); err != nil {
 			lastErr = err
-			ec.logError(err)
+			ec.logError(err, ec.rpcs[i])
 			continue
 		} else {
 			return block, nil
@@ -197,9 +197,9 @@ func (ec *EthereumClient) BlockByNumber(ctx context.Context, number *big.Int) (*
 }
 
 func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Hash) (tx *types.Transaction, isPending bool, err error) {
-	for _, cli := range ec.ethClis {
+	for i, cli := range ec.ethClis {
 		if tx, isPending, err = cli.TransactionByHash(ctx, hash); err != nil {
-			ec.logError(err)
+			ec.logError(err, ec.rpcs[i])
 			continue
 		} else {
 			return tx, isPending, nil
@@ -210,10 +210,10 @@ func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Has
 
 func (ec *EthereumClient) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 	var lastErr error
-	for _, cli := range ec.ethClis {
+	for i, cli := range ec.ethClis {
 		if price, err := cli.SuggestGasPrice(ctx); err != nil {
 			lastErr = err
-			ec.logError(err)
+			ec.logError(err, ec.rpcs[i])
 			continue
 		} else {
 			return price, nil
@@ -236,8 +236,12 @@ func (ec *EthereumClient) GetAvailableRPCCli() (*ethclient.Client, error) {
 	return nil, fmt.Errorf("all eth clients are down:%w", lastErr)
 }
 
-func (ec *EthereumClient) logError(err error) {
+func (ec *EthereumClient) logError(err error, rpcs ...string) {
 	if ec.logger != nil && !errors.Is(err, ethereum.NotFound) {
-		ec.logger.Error(err)
+		if len(rpcs) > 0 {
+			ec.logger.WithField("rpc", rpcs[0]).Error(err)
+		} else {
+			ec.logger.Error(err)
+		}
 	}
 }
