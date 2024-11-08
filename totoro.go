@@ -119,9 +119,21 @@ func (ec *EthereumClient) AddSubscribeContract(contracts ...common.Address) {
 	}
 }
 
+func (ec *EthereumClient) RemoveSubscribeContract(contracts ...common.Address) {
+	for _, contract := range contracts {
+		delete(ec.contracts, contract)
+	}
+}
+
 func (ec *EthereumClient) AddSubscribeTopic(topics ...string) {
 	for _, topic := range topics {
 		ec.topics[topic] = struct{}{}
+	}
+}
+
+func (ec *EthereumClient) RemoveSubscribeTopic(topics ...string) {
+	for _, topic := range topics {
+		delete(ec.topics, topic)
 	}
 }
 
