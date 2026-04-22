@@ -1,3 +1,5 @@
+// Package totoro provides a small failover wrapper around go-ethereum RPC
+// clients for EVM reads and polling log subscriptions.
 package totoro
 
 import (
@@ -5,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	defaultBlockUpdateInternal = time.Second * 30
+	defaultBlockUpdateInterval = time.Second * 30
 	defaultAttemptTimeout      = time.Second * 5
 	defaultMinRetryBackoff     = time.Second * 30
 	defaultMaxRetryBackoff     = time.Minute * 5
@@ -144,39 +145,43 @@ func newRPCEndpoint(url string) *rpcEndpoint {
 	}
 }
 
-// EthereumClient represents a ethereum client.
+// EthereumClient represents a failover Ethereum RPC client.
 type EthereumClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	initialBlock     uint64
-	attemptTimeout   time.Duration
-	updateInterval   time.Duration
-	minRetryBackoff  time.Duration
-	maxRetryBackoff  time.Duration
-	confirmations    uint64
-	maxLogBlockRange uint64
-	endpoints        []*rpcEndpoint
+	attemptTimeout         time.Duration
+	updateInterval         time.Duration
+	minRetryBackoff        time.Duration
+	maxRetryBackoff        time.Duration
+	confirmations          uint64
+	maxLogBlockRange       uint64
+	subscriptionStartBlock uint64
+	endpoints              []*rpcEndpoint
 
 	mu        sync.RWMutex
-	prevBlock uint64
 	currBlock uint64
 	updateChs map[chan struct{}]struct{}
 	contracts map[common.Address]struct{}
-	topics    map[string]struct{}
+	topics    map[common.Hash]struct{}
 	logger    *logrus.Entry
 
 	closeOnce sync.Once
 }
 
+// NewEthereumClient creates a failover Ethereum RPC client.
+//
+// Client creation succeeds when at least one configured RPC can serve the
+// initial block number request. Endpoints that fail during startup are retained
+// as unhealthy endpoints and may be retried later.
 func NewEthereumClient(ctx context.Context, rpcs []string, opts ...Option) (*EthereumClient, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("context is nil")
 	}
 	cfg := clientConfig{
 		attemptTimeout:      defaultAttemptTimeout,
-		blockUpdateInterval: defaultBlockUpdateInternal,
+		blockUpdateInterval: defaultBlockUpdateInterval,
 		minRetryBackoff:     defaultMinRetryBackoff,
 		maxRetryBackoff:     defaultMaxRetryBackoff,
 		maxLogBlockRange:    1_000,
@@ -200,7 +205,7 @@ func NewEthereumClient(ctx context.Context, rpcs []string, opts ...Option) (*Eth
 		endpoints:        make([]*rpcEndpoint, 0, len(rpcs)),
 		updateChs:        map[chan struct{}]struct{}{},
 		contracts:        map[common.Address]struct{}{},
-		topics:           map[string]struct{}{},
+		topics:           map[common.Hash]struct{}{},
 	}
 	now := time.Now()
 	for _, rpc := range rpcs {
@@ -223,8 +228,7 @@ func NewEthereumClient(ctx context.Context, rpcs []string, opts ...Option) (*Eth
 		cancel()
 		return nil, err
 	}
-	sub.initialBlock = blockNum
-	sub.prevBlock = blockNum
+	sub.subscriptionStartBlock = blockNum
 	sub.currBlock = blockNum
 	sub.wg.Add(1)
 	go sub.updateBlockNumLoop()
@@ -267,6 +271,8 @@ func (ec *EthereumClient) updateBlockNumLoop() {
 	}
 }
 
+// SetLogger configures the logger used for background and per-endpoint RPC
+// errors. Passing nil disables logging.
 func (ec *EthereumClient) SetLogger(entry *logrus.Entry) {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
@@ -274,7 +280,11 @@ func (ec *EthereumClient) SetLogger(entry *logrus.Entry) {
 	ec.logger = entry
 }
 
-// Subscribe sends logs matching the client's configured contract/topic filters to ch.
+// Subscribe sends logs matching the legacy contract/topic filters to ch until
+// the client is closed.
+//
+// New code should prefer SubscribeLogs because it accepts a full
+// ethereum.FilterQuery and exposes polling errors.
 func (ec *EthereumClient) Subscribe(ch chan types.Log) {
 	sub := ec.subscribeLogs(ec.ctx, ec.subscribeFilter)
 	defer sub.Close()
@@ -295,6 +305,7 @@ func (ec *EthereumClient) Subscribe(ch chan types.Log) {
 	}
 }
 
+// AddSubscribeContract adds contract addresses to the legacy Subscribe filter.
 func (ec *EthereumClient) AddSubscribeContract(contracts ...common.Address) {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
@@ -304,6 +315,8 @@ func (ec *EthereumClient) AddSubscribeContract(contracts ...common.Address) {
 	}
 }
 
+// RemoveSubscribeContract removes contract addresses from the legacy Subscribe
+// filter.
 func (ec *EthereumClient) RemoveSubscribeContract(contracts ...common.Address) {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
@@ -313,15 +326,17 @@ func (ec *EthereumClient) RemoveSubscribeContract(contracts ...common.Address) {
 	}
 }
 
+// AddSubscribeTopic adds topic0 hashes to the legacy Subscribe filter.
 func (ec *EthereumClient) AddSubscribeTopic(topics ...string) error {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
 
 	for _, topic := range topics {
-		if !isHexHash(topic) {
-			return fmt.Errorf("invalid topic hash %q", topic)
+		hash, err := parseTopicHash(topic)
+		if err != nil {
+			return err
 		}
-		ec.topics[topic] = struct{}{}
+		ec.topics[hash] = struct{}{}
 	}
 	return nil
 }
@@ -332,48 +347,27 @@ func (ec *EthereumClient) AddSubscribeTopics(topics ...common.Hash) {
 	defer ec.mu.Unlock()
 
 	for _, topic := range topics {
-		ec.topics[topic.Hex()] = struct{}{}
+		ec.topics[topic] = struct{}{}
 	}
 }
 
+// RemoveSubscribeTopic removes topic0 hashes from the legacy Subscribe filter.
 func (ec *EthereumClient) RemoveSubscribeTopic(topics ...string) {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
 
 	for _, topic := range topics {
-		delete(ec.topics, topic)
+		hash, err := parseTopicHash(topic)
+		if err != nil {
+			continue
+		}
+		delete(ec.topics, hash)
 	}
-}
-
-func (ec *EthereumClient) getEthereumQueryFilter() (ethereum.FilterQuery, uint64, bool) {
-	ec.mu.RLock()
-	defer ec.mu.RUnlock()
-
-	if ec.currBlock <= ec.prevBlock {
-		return ethereum.FilterQuery{}, 0, false
-	}
-
-	addresses := make([]common.Address, 0, len(ec.contracts))
-	for addr := range ec.contracts {
-		addresses = append(addresses, addr)
-	}
-	topics := make([]common.Hash, 0, len(ec.topics))
-	for topic := range ec.topics {
-		topics = append(topics, common.HexToHash(topic))
-	}
-	fromBlock := ec.prevBlock
-	if fromBlock > 0 {
-		fromBlock--
-	}
-	return ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(fromBlock),
-		ToBlock:   new(big.Int).SetUint64(ec.currBlock),
-		Addresses: addresses,
-		Topics:    [][]common.Hash{topics},
-	}, ec.currBlock, true
 }
 
 // SubscribeLogs starts a polling log subscription for the provided Ethereum filter.
+//
+// The returned subscription must be closed when the caller is done with it.
 func (ec *EthereumClient) SubscribeLogs(ctx context.Context, filter ethereum.FilterQuery) *LogSubscription {
 	filter = cloneFilterQuery(filter)
 	return ec.subscribeLogs(ctx, func() ethereum.FilterQuery {
@@ -391,7 +385,7 @@ func (ec *EthereumClient) subscribeLogs(ctx context.Context, filterProvider func
 		errs:      make(chan error, 16),
 		done:      make(chan struct{}),
 		cancel:    cancel,
-		prevBlock: ec.subscriptionStartBlock(),
+		prevBlock: ec.currentSubscriptionStartBlock(),
 	}
 
 	updateCh := make(chan struct{}, 1)
@@ -446,6 +440,8 @@ func (ec *EthereumClient) Health() []EndpointHealth {
 	return snapshots
 }
 
+// BlockNumber returns the latest block number from the first available RPC
+// endpoint.
 func (ec *EthereumClient) BlockNumber() (uint64, error) {
 	return ec.blockNumber(ec.ctx)
 }
@@ -465,24 +461,30 @@ func (ec *EthereumClient) blockNumber(ctx context.Context) (uint64, error) {
 	})
 }
 
+// FilterLogs returns logs matching filter from the first available RPC endpoint.
 func (ec *EthereumClient) FilterLogs(ctx context.Context, filter ethereum.FilterQuery) ([]types.Log, error) {
 	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) ([]types.Log, error) {
 		return cli.FilterLogs(ctx, filter)
 	}, nil)
 }
 
+// TransactionReceipt returns a transaction receipt from the first available RPC
+// endpoint.
 func (ec *EthereumClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
 	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) (*types.Receipt, error) {
 		return cli.TransactionReceipt(ctx, txHash)
 	}, nil)
 }
 
+// BlockByNumber returns a block from the first available RPC endpoint.
 func (ec *EthereumClient) BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error) {
 	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) (*types.Block, error) {
 		return cli.BlockByNumber(ctx, number)
 	}, nil)
 }
 
+// TransactionByHash returns a transaction and pending status from the first
+// available RPC endpoint.
 func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Hash) (tx *types.Transaction, isPending bool, err error) {
 	type transactionByHashResult struct {
 		tx        *types.Transaction
@@ -498,12 +500,16 @@ func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Has
 	return result.tx, result.isPending, nil
 }
 
+// SuggestGasPrice returns a gas price suggestion from the first available RPC
+// endpoint.
 func (ec *EthereumClient) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) (*big.Int, error) {
 		return cli.SuggestGasPrice(ctx)
 	}, nil)
 }
 
+// GetAvailableRPCCli returns the first RPC client that can serve a block number
+// request.
 func (ec *EthereumClient) GetAvailableRPCCli() (*ethclient.Client, error) {
 	return doRPC(ec, ec.ctx, func(ctx context.Context, cli *ethclient.Client) (*ethclient.Client, error) {
 		if _, err := cli.BlockNumber(ctx); err != nil {
@@ -604,12 +610,15 @@ func (ec *EthereumClient) subscribeFilter() ethereum.FilterQuery {
 	}
 	topics := make([]common.Hash, 0, len(ec.topics))
 	for topic := range ec.topics {
-		topics = append(topics, common.HexToHash(topic))
+		topics = append(topics, topic)
 	}
-	return ethereum.FilterQuery{
+	filter := ethereum.FilterQuery{
 		Addresses: addresses,
-		Topics:    [][]common.Hash{topics},
 	}
+	if len(topics) > 0 {
+		filter.Topics = [][]common.Hash{topics}
+	}
+	return filter
 }
 
 func (ec *EthereumClient) registerUpdateCh(updateCh chan struct{}) {
@@ -622,11 +631,11 @@ func (ec *EthereumClient) registerUpdateCh(updateCh chan struct{}) {
 	ec.updateChs[updateCh] = struct{}{}
 }
 
-func (ec *EthereumClient) subscriptionStartBlock() uint64 {
+func (ec *EthereumClient) currentSubscriptionStartBlock() uint64 {
 	ec.mu.RLock()
 	defer ec.mu.RUnlock()
 
-	return ec.prevBlock
+	return ec.subscriptionStartBlock
 }
 
 type rpcOperation[T any] func(context.Context, *ethclient.Client) (T, error)
@@ -651,40 +660,57 @@ func doRPC[T any](
 		}
 		attempted = true
 
-		attemptCtx, cancel, err := ec.newAttemptContext(ctx)
-		if err != nil {
-			return zero, err
-		}
-		start := time.Now()
-		cli, err := endpoint.clientForAttempt(attemptCtx)
+		result, err := attemptRPC(ec, ctx, endpoint, op, onSuccess)
 		if err == nil {
-			var result T
-			result, err = op(attemptCtx, cli)
-			latency := time.Since(start)
-			cancel()
-			if err != nil {
-				endpoint.recordFailure(time.Now(), latency, err, ec.minRetryBackoff, ec.maxRetryBackoff)
-				ec.logError(err, endpoint.url)
-				lastErr = err
-				continue
-			}
-			endpoint.recordSuccess(time.Now(), latency)
-			if onSuccess != nil {
-				onSuccess(endpoint, result)
-			}
 			return result, nil
 		}
-
-		latency := time.Since(start)
-		cancel()
-		endpoint.recordFailure(time.Now(), latency, err, ec.minRetryBackoff, ec.maxRetryBackoff)
-		ec.logError(err, endpoint.url)
 		lastErr = err
 	}
 	if !attempted && lastErr == nil {
 		lastErr = fmt.Errorf("no rpc endpoints configured")
 	}
 	return zero, allClientsDownError(lastErr)
+}
+
+func attemptRPC[T any](
+	ec *EthereumClient,
+	ctx context.Context,
+	endpoint *rpcEndpoint,
+	op rpcOperation[T],
+	onSuccess func(*rpcEndpoint, T),
+) (T, error) {
+	var zero T
+	attemptCtx, cancel, err := ec.newAttemptContext(ctx)
+	if err != nil {
+		return zero, err
+	}
+	defer cancel()
+
+	start := time.Now()
+	cli, err := endpoint.clientForAttempt(attemptCtx)
+	latency := time.Since(start)
+	if err != nil {
+		ec.recordEndpointFailure(endpoint, latency, err)
+		return zero, err
+	}
+
+	result, err := op(attemptCtx, cli)
+	latency = time.Since(start)
+	if err != nil {
+		ec.recordEndpointFailure(endpoint, latency, err)
+		return zero, err
+	}
+
+	endpoint.recordSuccess(time.Now(), latency)
+	if onSuccess != nil {
+		onSuccess(endpoint, result)
+	}
+	return result, nil
+}
+
+func (ec *EthereumClient) recordEndpointFailure(endpoint *rpcEndpoint, latency time.Duration, err error) {
+	endpoint.recordFailure(time.Now(), latency, err, ec.minRetryBackoff, ec.maxRetryBackoff)
+	ec.logError(err, endpoint.url)
 }
 
 func (ec *EthereumClient) setCurrBlock(blockNum uint64) {
@@ -694,11 +720,11 @@ func (ec *EthereumClient) setCurrBlock(blockNum uint64) {
 	ec.currBlock = blockNum
 }
 
-func (ec *EthereumClient) setPrevBlock(blockNum uint64) {
+func (ec *EthereumClient) setSubscriptionStartBlock(blockNum uint64) {
 	ec.mu.Lock()
 	defer ec.mu.Unlock()
 
-	ec.prevBlock = blockNum
+	ec.subscriptionStartBlock = blockNum
 }
 
 func (ec *EthereumClient) notifyBlockUpdate() {
@@ -924,17 +950,12 @@ func cloneFilterQuery(filter ethereum.FilterQuery) ethereum.FilterQuery {
 	return cloned
 }
 
-func isHexHash(s string) bool {
-	if len(s) != 66 || !strings.HasPrefix(s, "0x") {
-		return false
+func parseTopicHash(topic string) (common.Hash, error) {
+	var hash common.Hash
+	if err := hash.UnmarshalText([]byte(topic)); err != nil {
+		return common.Hash{}, fmt.Errorf("invalid topic hash %q: %w", topic, err)
 	}
-	for _, r := range s[2:] {
-		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
-			continue
-		}
-		return false
-	}
-	return true
+	return hash, nil
 }
 
 func retryBackoff(failures uint64, minBackoff, maxBackoff time.Duration) time.Duration {

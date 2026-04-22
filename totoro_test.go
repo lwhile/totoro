@@ -168,11 +168,7 @@ func TestBlockNumberRetriesEndpointAfterBackoff(t *testing.T) {
 	}
 	defer client.Close()
 
-	time.Sleep(20 * time.Millisecond)
-	got, err := client.BlockNumber()
-	if err != nil {
-		t.Fatalf("BlockNumber() error = %v, want nil", err)
-	}
+	got := waitForBlockNumber(t, client, 100)
 	if got != 100 {
 		t.Errorf("BlockNumber() = %d, want %d", got, 100)
 	}
@@ -203,7 +199,7 @@ func TestCloseStopsBackgroundBlockUpdater(t *testing.T) {
 	waitForRPCRequests(t, &calls, 2)
 	client.Close()
 	afterClose := calls.Load()
-	time.Sleep(40 * time.Millisecond)
+	assertRPCRequestsStable(t, &calls, afterClose, 40*time.Millisecond)
 
 	if got := calls.Load(); got != afterClose {
 		t.Errorf("RPC calls after Close() = %d, want %d", got, afterClose)
@@ -213,9 +209,7 @@ func TestCloseStopsBackgroundBlockUpdater(t *testing.T) {
 func TestSubscribeFilterMutationIsConcurrentSafe(t *testing.T) {
 	client := &EthereumClient{
 		contracts: map[common.Address]struct{}{},
-		topics:    map[string]struct{}{},
-		prevBlock: 10,
-		currBlock: 11,
+		topics:    map[common.Hash]struct{}{},
 	}
 
 	var wg sync.WaitGroup
@@ -242,7 +236,7 @@ func TestSubscribeFilterMutationIsConcurrentSafe(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 1000; i++ {
-			_, _, _ = client.getEthereumQueryFilter()
+			_ = client.subscribeFilter()
 		}
 	}()
 
@@ -252,7 +246,7 @@ func TestSubscribeFilterMutationIsConcurrentSafe(t *testing.T) {
 func TestAddSubscribeTopicValidatesHash(t *testing.T) {
 	client := &EthereumClient{
 		contracts: map[common.Address]struct{}{},
-		topics:    map[string]struct{}{},
+		topics:    map[common.Hash]struct{}{},
 	}
 
 	if err := client.AddSubscribeTopic("bad-topic"); err == nil {
@@ -261,6 +255,16 @@ func TestAddSubscribeTopicValidatesHash(t *testing.T) {
 	topic := common.BigToHash(big.NewInt(1)).Hex()
 	if err := client.AddSubscribeTopic(topic); err != nil {
 		t.Fatalf("AddSubscribeTopic(%q) error = %v, want nil", topic, err)
+	}
+	mixedCaseTopic := "0x" + strings.ToUpper(topic[2:])
+	client.RemoveSubscribeTopic(mixedCaseTopic)
+	filter := client.subscribeFilter()
+	var topicCount int
+	if len(filter.Topics) > 0 {
+		topicCount = len(filter.Topics[0])
+	}
+	if topicCount != 0 {
+		t.Errorf("RemoveSubscribeTopic(%q) topic count = %d, want %d", mixedCaseTopic, topicCount, 0)
 	}
 }
 
@@ -305,7 +309,7 @@ func TestSubscribeLogsChunksDeduplicatesAndAdvancesCursor(t *testing.T) {
 		t.Fatalf("NewEthereumClient(%v) error = %v, want nil", []string{rpc.URL}, err)
 	}
 	defer client.Close()
-	client.setPrevBlock(0)
+	client.setSubscriptionStartBlock(0)
 	client.setCurrBlock(5)
 
 	sub := client.SubscribeLogs(context.Background(), ethereumFilterForTest())
@@ -368,7 +372,7 @@ func TestSubscribeLogsDoesNotAdvanceCursorAfterChunkError(t *testing.T) {
 		t.Fatalf("NewEthereumClient(%v) error = %v, want nil", []string{rpc.URL}, err)
 	}
 	defer client.Close()
-	client.setPrevBlock(0)
+	client.setSubscriptionStartBlock(0)
 	client.setCurrBlock(5)
 
 	sub := client.SubscribeLogs(context.Background(), ethereumFilterForTest())
@@ -409,7 +413,7 @@ func TestSubscribeLogsKeepsIndependentCursorPerSubscription(t *testing.T) {
 		t.Fatalf("NewEthereumClient(%v) error = %v, want nil", []string{rpc.URL}, err)
 	}
 	defer client.Close()
-	client.setPrevBlock(0)
+	client.setSubscriptionStartBlock(0)
 	client.setCurrBlock(1)
 
 	subA := client.SubscribeLogs(context.Background(), ethereumFilterForTest())
@@ -447,7 +451,7 @@ func TestSubscribeReturnsAfterCloseWhenOutputChannelBlocks(t *testing.T) {
 		case "eth_blockNumber":
 			return testRPCResult{result: "0x1"}
 		case "eth_getLogs":
-			return testRPCResult{result: []types.Log{testLog(1, 0)}}
+			return testRPCResult{result: []types.Log{testLog(1, 0), testLog(1, 1)}}
 		default:
 			return testRPCResult{err: &testRPCError{code: -32601, message: "method not found"}}
 		}
@@ -457,7 +461,8 @@ func TestSubscribeReturnsAfterCloseWhenOutputChannelBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEthereumClient(%v) error = %v, want nil", []string{rpc.URL}, err)
 	}
-	client.setPrevBlock(0)
+	defer client.Close()
+	client.setSubscriptionStartBlock(0)
 	client.setCurrBlock(1)
 
 	logs := make(chan types.Log)
@@ -468,7 +473,11 @@ func TestSubscribeReturnsAfterCloseWhenOutputChannelBlocks(t *testing.T) {
 	}()
 	waitForUpdateSubscribers(t, client, 1)
 	client.notifyBlockUpdate()
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-logs:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("Subscribe() did not send first log before Close()")
+	}
 	client.Close()
 
 	select {
@@ -501,7 +510,7 @@ func TestSubscribeRebuildsLegacyFilterEachPoll(t *testing.T) {
 		t.Fatalf("NewEthereumClient(%v) error = %v, want nil", []string{rpc.URL}, err)
 	}
 	defer client.Close()
-	client.setPrevBlock(0)
+	client.setSubscriptionStartBlock(0)
 	logs := make(chan types.Log, 1)
 	go client.Subscribe(logs)
 	waitForUpdateSubscribers(t, client, 1)
@@ -705,6 +714,29 @@ func receiveErr(t *testing.T, errs <-chan error) error {
 	return nil
 }
 
+func waitForBlockNumber(t *testing.T, client *EthereumClient, want uint64) uint64 {
+	t.Helper()
+
+	deadline := time.After(500 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	var got uint64
+	var err error
+	for {
+		got, err = client.BlockNumber()
+		if err == nil && got == want {
+			return got
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("BlockNumber() = %d, error = %v, want %d", got, err, want)
+		case <-ticker.C:
+		}
+	}
+}
+
 func waitForFilterCount(t *testing.T, mu *sync.Mutex, filters *[]map[string]any, want int) {
 	t.Helper()
 
@@ -784,6 +816,27 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func assertRPCRequestsStable(t *testing.T, calls *atomic.Int64, want int64, duration time.Duration) {
+	t.Helper()
+
+	deadline := time.After(duration)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		got := calls.Load()
+		if got != want {
+			t.Fatalf("RPC request count = %d, want stable at %d", got, want)
+		}
+
+		select {
+		case <-deadline:
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func waitForRPCRequests(t *testing.T, calls *atomic.Int64, want int64) {
