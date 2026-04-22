@@ -18,11 +18,15 @@ import (
 const (
 	defaultBlockUpdateInternal = time.Second * 30
 	defaultAttemptTimeout      = time.Second * 5
+	defaultMinRetryBackoff     = time.Second * 30
+	defaultMaxRetryBackoff     = time.Minute * 5
 )
 
 type clientConfig struct {
 	attemptTimeout      time.Duration
 	blockUpdateInterval time.Duration
+	minRetryBackoff     time.Duration
+	maxRetryBackoff     time.Duration
 }
 
 // Option configures an EthereumClient.
@@ -50,17 +54,62 @@ func WithBlockUpdateInterval(interval time.Duration) Option {
 	}
 }
 
+// WithRetryBackoff configures the minimum and maximum retry backoff for failed endpoints.
+func WithRetryBackoff(minBackoff, maxBackoff time.Duration) Option {
+	return func(cfg *clientConfig) error {
+		if minBackoff <= 0 {
+			return fmt.Errorf("minimum retry backoff must be positive")
+		}
+		if maxBackoff < minBackoff {
+			return fmt.Errorf("maximum retry backoff must be greater than or equal to minimum retry backoff")
+		}
+		cfg.minRetryBackoff = minBackoff
+		cfg.maxRetryBackoff = maxBackoff
+		return nil
+	}
+}
+
+type endpointHealth uint8
+
+const (
+	endpointHealthHealthy endpointHealth = iota + 1
+	endpointHealthUnhealthy
+)
+
+type rpcEndpoint struct {
+	mu sync.RWMutex
+
+	url    string
+	client *ethclient.Client
+	health endpointHealth
+
+	consecutiveFailures uint64
+	lastErr             error
+	lastSuccess         time.Time
+	latency             time.Duration
+	observedHead        uint64
+	nextRetry           time.Time
+}
+
+func newRPCEndpoint(url string) *rpcEndpoint {
+	return &rpcEndpoint{
+		url:    url,
+		health: endpointHealthHealthy,
+	}
+}
+
 // EthereumClient represents a ethereum client.
 type EthereumClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	rpcs           []string
-	ethClis        []*ethclient.Client
-	initialBlock   uint64
-	attemptTimeout time.Duration
-	updateInterval time.Duration
+	initialBlock    uint64
+	attemptTimeout  time.Duration
+	updateInterval  time.Duration
+	minRetryBackoff time.Duration
+	maxRetryBackoff time.Duration
+	endpoints       []*rpcEndpoint
 
 	mu        sync.RWMutex
 	prevBlock uint64
@@ -80,6 +129,8 @@ func NewEthereumClient(ctx context.Context, rpcs []string, opts ...Option) (*Eth
 	cfg := clientConfig{
 		attemptTimeout:      defaultAttemptTimeout,
 		blockUpdateInterval: defaultBlockUpdateInternal,
+		minRetryBackoff:     defaultMinRetryBackoff,
+		maxRetryBackoff:     defaultMaxRetryBackoff,
 	}
 	for _, opt := range opts {
 		if err := opt(&cfg); err != nil {
@@ -89,25 +140,30 @@ func NewEthereumClient(ctx context.Context, rpcs []string, opts ...Option) (*Eth
 
 	clientCtx, cancel := context.WithCancel(ctx)
 	sub := &EthereumClient{
-		ctx:            clientCtx,
-		cancel:         cancel,
-		rpcs:           append([]string(nil), rpcs...),
-		ethClis:        make([]*ethclient.Client, 0, len(rpcs)),
-		attemptTimeout: cfg.attemptTimeout,
-		updateInterval: cfg.blockUpdateInterval,
-		contracts:      map[common.Address]struct{}{},
-		topics:         map[string]struct{}{},
+		ctx:             clientCtx,
+		cancel:          cancel,
+		attemptTimeout:  cfg.attemptTimeout,
+		updateInterval:  cfg.blockUpdateInterval,
+		minRetryBackoff: cfg.minRetryBackoff,
+		maxRetryBackoff: cfg.maxRetryBackoff,
+		endpoints:       make([]*rpcEndpoint, 0, len(rpcs)),
+		contracts:       map[common.Address]struct{}{},
+		topics:          map[string]struct{}{},
 	}
+	now := time.Now()
 	for _, rpc := range rpcs {
+		endpoint := newRPCEndpoint(rpc)
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, cfg.attemptTimeout)
 		cli, err := ethclient.DialContext(attemptCtx, rpc)
 		attemptCancel()
 		if err != nil {
-			sub.closeClients()
-			cancel()
-			return nil, err
+			endpoint.recordFailure(now, 0, err, cfg.minRetryBackoff, cfg.maxRetryBackoff)
+			sub.endpoints = append(sub.endpoints, endpoint)
+			continue
 		}
-		sub.ethClis = append(sub.ethClis, cli)
+		endpoint.setClient(cli)
+		endpoint.recordSuccess(now, 0)
+		sub.endpoints = append(sub.endpoints, endpoint)
 	}
 	blockNum, err := sub.blockNumber(ctx)
 	if err != nil {
@@ -268,142 +324,66 @@ func (ec *EthereumClient) BlockNumber() (uint64, error) {
 }
 
 func (ec *EthereumClient) blockNumber(ctx context.Context) (uint64, error) {
-	var lastErr error
-	for i, cli := range ec.ethClis {
-		attemptCtx, cancel, err := ec.newAttemptContext(ctx)
+	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) (uint64, error) {
+		num, err := cli.BlockNumber(ctx)
 		if err != nil {
 			return 0, err
 		}
-		num, err := cli.BlockNumber(attemptCtx)
-		cancel()
-		if err != nil {
-			lastErr = err
-			ec.logError(err, ec.rpcs[i])
-			continue
-		}
 		if num == 0 {
-			err = fmt.Errorf("rpc returned block number 0")
-			lastErr = err
-			ec.logError(err, ec.rpcs[i])
-			continue
+			return 0, fmt.Errorf("rpc returned block number 0")
 		}
 		return num, nil
-	}
-	return 0, allClientsDownError(lastErr)
+	}, func(endpoint *rpcEndpoint, num uint64) {
+		endpoint.setObservedHead(num)
+	})
 }
 
 func (ec *EthereumClient) FilterLogs(ctx context.Context, filter ethereum.FilterQuery) ([]types.Log, error) {
-	var lastErr error
-	for i, cli := range ec.ethClis {
-		attemptCtx, cancel, err := ec.newAttemptContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-		logs, err := cli.FilterLogs(attemptCtx, filter)
-		cancel()
-		if err != nil {
-			lastErr = err
-			ec.logError(err, ec.rpcs[i])
-			continue
-		}
-		return logs, nil
-	}
-	return nil, allClientsDownError(lastErr)
+	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) ([]types.Log, error) {
+		return cli.FilterLogs(ctx, filter)
+	}, nil)
 }
 
 func (ec *EthereumClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
-	var lastErr error
-	for i, cli := range ec.ethClis {
-		attemptCtx, cancel, err := ec.newAttemptContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-		receipt, err := cli.TransactionReceipt(attemptCtx, txHash)
-		cancel()
-		if err != nil {
-			lastErr = err
-			ec.logError(err, ec.rpcs[i])
-			continue
-		}
-		return receipt, nil
-	}
-	return nil, allClientsDownError(lastErr)
+	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) (*types.Receipt, error) {
+		return cli.TransactionReceipt(ctx, txHash)
+	}, nil)
 }
 
 func (ec *EthereumClient) BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error) {
-	var lastErr error
-	for i, cli := range ec.ethClis {
-		attemptCtx, cancel, err := ec.newAttemptContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-		block, err := cli.BlockByNumber(attemptCtx, number)
-		cancel()
-		if err != nil {
-			lastErr = err
-			ec.logError(err, ec.rpcs[i])
-			continue
-		}
-		return block, nil
-	}
-	return nil, allClientsDownError(lastErr)
+	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) (*types.Block, error) {
+		return cli.BlockByNumber(ctx, number)
+	}, nil)
 }
 
 func (ec *EthereumClient) TransactionByHash(ctx context.Context, hash common.Hash) (tx *types.Transaction, isPending bool, err error) {
-	var lastErr error
-	for i, cli := range ec.ethClis {
-		attemptCtx, cancel, err := ec.newAttemptContext(ctx)
-		if err != nil {
-			return nil, false, err
-		}
-		tx, isPending, err = cli.TransactionByHash(attemptCtx, hash)
-		cancel()
-		if err != nil {
-			lastErr = err
-			ec.logError(err, ec.rpcs[i])
-			continue
-		}
-		return tx, isPending, nil
+	type transactionByHashResult struct {
+		tx        *types.Transaction
+		isPending bool
 	}
-	return nil, false, allClientsDownError(lastErr)
+	result, err := doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) (transactionByHashResult, error) {
+		tx, isPending, err := cli.TransactionByHash(ctx, hash)
+		return transactionByHashResult{tx: tx, isPending: isPending}, err
+	}, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	return result.tx, result.isPending, nil
 }
 
 func (ec *EthereumClient) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
-	var lastErr error
-	for i, cli := range ec.ethClis {
-		attemptCtx, cancel, err := ec.newAttemptContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-		price, err := cli.SuggestGasPrice(attemptCtx)
-		cancel()
-		if err != nil {
-			lastErr = err
-			ec.logError(err, ec.rpcs[i])
-			continue
-		}
-		return price, nil
-	}
-	return nil, allClientsDownError(lastErr)
+	return doRPC(ec, ctx, func(ctx context.Context, cli *ethclient.Client) (*big.Int, error) {
+		return cli.SuggestGasPrice(ctx)
+	}, nil)
 }
 
 func (ec *EthereumClient) GetAvailableRPCCli() (*ethclient.Client, error) {
-	var lastErr error
-	for _, cli := range ec.ethClis {
-		attemptCtx, cancel, err := ec.newAttemptContext(ec.ctx)
-		if err != nil {
+	return doRPC(ec, ec.ctx, func(ctx context.Context, cli *ethclient.Client) (*ethclient.Client, error) {
+		if _, err := cli.BlockNumber(ctx); err != nil {
 			return nil, err
 		}
-		_, err = cli.BlockNumber(attemptCtx)
-		cancel()
-		if err != nil {
-			lastErr = err
-			ec.logError(err)
-			continue
-		}
 		return cli, nil
-	}
-	return nil, allClientsDownError(lastErr)
+	}, nil)
 }
 
 func (ec *EthereumClient) logError(err error, rpcs ...string) {
@@ -432,6 +412,64 @@ func (ec *EthereumClient) newAttemptContext(ctx context.Context) (context.Contex
 	}
 	attemptCtx, cancel := context.WithTimeout(ctx, ec.attemptTimeout)
 	return attemptCtx, cancel, nil
+}
+
+type rpcOperation[T any] func(context.Context, *ethclient.Client) (T, error)
+
+func doRPC[T any](
+	ec *EthereumClient,
+	ctx context.Context,
+	op rpcOperation[T],
+	onSuccess func(*rpcEndpoint, T),
+) (T, error) {
+	var zero T
+	var lastErr error
+	attempted := false
+	now := time.Now()
+
+	for _, endpoint := range ec.endpoints {
+		if !endpoint.canAttempt(now) {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("all endpoints are in retry backoff")
+			}
+			continue
+		}
+		attempted = true
+
+		attemptCtx, cancel, err := ec.newAttemptContext(ctx)
+		if err != nil {
+			return zero, err
+		}
+		start := time.Now()
+		cli, err := endpoint.clientForAttempt(attemptCtx)
+		if err == nil {
+			var result T
+			result, err = op(attemptCtx, cli)
+			latency := time.Since(start)
+			cancel()
+			if err != nil {
+				endpoint.recordFailure(time.Now(), latency, err, ec.minRetryBackoff, ec.maxRetryBackoff)
+				ec.logError(err, endpoint.url)
+				lastErr = err
+				continue
+			}
+			endpoint.recordSuccess(time.Now(), latency)
+			if onSuccess != nil {
+				onSuccess(endpoint, result)
+			}
+			return result, nil
+		}
+
+		latency := time.Since(start)
+		cancel()
+		endpoint.recordFailure(time.Now(), latency, err, ec.minRetryBackoff, ec.maxRetryBackoff)
+		ec.logError(err, endpoint.url)
+		lastErr = err
+	}
+	if !attempted && lastErr == nil {
+		lastErr = fmt.Errorf("no rpc endpoints configured")
+	}
+	return zero, allClientsDownError(lastErr)
 }
 
 func (ec *EthereumClient) setCurrBlock(blockNum uint64) {
@@ -472,9 +510,112 @@ func (ec *EthereumClient) clearUpdateCh(updateCh chan struct{}) {
 }
 
 func (ec *EthereumClient) closeClients() {
-	for _, cli := range ec.ethClis {
-		cli.Close()
+	for _, endpoint := range ec.endpoints {
+		endpoint.close()
 	}
+}
+
+func (ep *rpcEndpoint) setClient(cli *ethclient.Client) {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	ep.client = cli
+}
+
+func (ep *rpcEndpoint) canAttempt(now time.Time) bool {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+
+	if ep.health == endpointHealthHealthy {
+		return true
+	}
+	return ep.nextRetry.IsZero() || !now.Before(ep.nextRetry)
+}
+
+func (ep *rpcEndpoint) clientForAttempt(ctx context.Context) (*ethclient.Client, error) {
+	ep.mu.RLock()
+	cli := ep.client
+	ep.mu.RUnlock()
+	if cli != nil {
+		return cli, nil
+	}
+
+	cli, err := ethclient.DialContext(ctx, ep.url)
+	if err != nil {
+		return nil, err
+	}
+
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	if ep.client != nil {
+		cli.Close()
+		return ep.client, nil
+	}
+	ep.client = cli
+	return ep.client, nil
+}
+
+func (ep *rpcEndpoint) recordSuccess(now time.Time, latency time.Duration) {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	ep.health = endpointHealthHealthy
+	ep.consecutiveFailures = 0
+	ep.lastErr = nil
+	ep.lastSuccess = now
+	ep.latency = latency
+	ep.nextRetry = time.Time{}
+}
+
+func (ep *rpcEndpoint) recordFailure(
+	now time.Time,
+	latency time.Duration,
+	err error,
+	minBackoff time.Duration,
+	maxBackoff time.Duration,
+) {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	ep.health = endpointHealthUnhealthy
+	ep.consecutiveFailures++
+	ep.lastErr = err
+	ep.latency = latency
+	ep.nextRetry = now.Add(retryBackoff(ep.consecutiveFailures, minBackoff, maxBackoff))
+}
+
+func (ep *rpcEndpoint) setObservedHead(head uint64) {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	ep.observedHead = head
+}
+
+func (ep *rpcEndpoint) close() {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	if ep.client != nil {
+		ep.client.Close()
+		ep.client = nil
+	}
+}
+
+func retryBackoff(failures uint64, minBackoff, maxBackoff time.Duration) time.Duration {
+	if minBackoff <= 0 {
+		return 0
+	}
+	backoff := minBackoff
+	for i := uint64(1); i < failures; i++ {
+		if backoff >= maxBackoff/2 {
+			return maxBackoff
+		}
+		backoff *= 2
+	}
+	if backoff > maxBackoff {
+		return maxBackoff
+	}
+	return backoff
 }
 
 func allClientsDownError(lastErr error) error {

@@ -77,6 +77,105 @@ func TestBlockNumberTimesOutSlowRPCAndFallsBack(t *testing.T) {
 	}
 }
 
+func TestNewEthereumClientAllowsPartialRPCInitialization(t *testing.T) {
+	workingRPC := newTestRPCServer(t, func(r *http.Request, method string) testRPCResult {
+		return testRPCResult{result: "0x2c"}
+	})
+
+	client, err := NewEthereumClient(context.Background(), []string{"://bad-url", workingRPC.URL})
+	if err != nil {
+		t.Fatalf("NewEthereumClient(%v) error = %v, want nil", []string{"://bad-url", workingRPC.URL}, err)
+	}
+	defer client.Close()
+
+	got, err := client.BlockNumber()
+	if err != nil {
+		t.Fatalf("BlockNumber() error = %v, want nil", err)
+	}
+	if got != 44 {
+		t.Errorf("BlockNumber() = %d, want %d", got, 44)
+	}
+}
+
+func TestNewEthereumClientFailsWhenAllRPCsUnavailable(t *testing.T) {
+	client, err := NewEthereumClient(context.Background(), []string{"://bad-url"})
+	if err == nil {
+		client.Close()
+		t.Fatalf("NewEthereumClient(%v) error = nil, want non-nil", []string{"://bad-url"})
+	}
+}
+
+func TestBlockNumberSkipsFailedEndpointDuringBackoff(t *testing.T) {
+	var failingCalls atomic.Int64
+	failingRPC := newTestRPCServer(t, func(r *http.Request, method string) testRPCResult {
+		failingCalls.Add(1)
+		return testRPCResult{err: &testRPCError{code: -32000, message: "forced failure"}}
+	})
+	workingRPC := newTestRPCServer(t, func(r *http.Request, method string) testRPCResult {
+		return testRPCResult{result: "0x2d"}
+	})
+
+	client, err := NewEthereumClient(
+		context.Background(),
+		[]string{failingRPC.URL, workingRPC.URL},
+		WithRetryBackoff(time.Second, time.Second),
+	)
+	if err != nil {
+		t.Fatalf("NewEthereumClient(%v) error = %v, want nil", []string{failingRPC.URL, workingRPC.URL}, err)
+	}
+	defer client.Close()
+
+	if got := failingCalls.Load(); got != 1 {
+		t.Fatalf("failing RPC calls after NewEthereumClient() = %d, want %d", got, 1)
+	}
+	got, err := client.BlockNumber()
+	if err != nil {
+		t.Fatalf("BlockNumber() error = %v, want nil", err)
+	}
+	if got != 45 {
+		t.Errorf("BlockNumber() = %d, want %d", got, 45)
+	}
+	if got := failingCalls.Load(); got != 1 {
+		t.Errorf("failing RPC calls after backoff skip = %d, want %d", got, 1)
+	}
+}
+
+func TestBlockNumberRetriesEndpointAfterBackoff(t *testing.T) {
+	var recoveringCalls atomic.Int64
+	recoveringRPC := newTestRPCServer(t, func(r *http.Request, method string) testRPCResult {
+		call := recoveringCalls.Add(1)
+		if call == 1 {
+			return testRPCResult{err: &testRPCError{code: -32000, message: "temporary failure"}}
+		}
+		return testRPCResult{result: "0x64"}
+	})
+	workingRPC := newTestRPCServer(t, func(r *http.Request, method string) testRPCResult {
+		return testRPCResult{result: "0x2e"}
+	})
+
+	client, err := NewEthereumClient(
+		context.Background(),
+		[]string{recoveringRPC.URL, workingRPC.URL},
+		WithRetryBackoff(10*time.Millisecond, 10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("NewEthereumClient(%v) error = %v, want nil", []string{recoveringRPC.URL, workingRPC.URL}, err)
+	}
+	defer client.Close()
+
+	time.Sleep(20 * time.Millisecond)
+	got, err := client.BlockNumber()
+	if err != nil {
+		t.Fatalf("BlockNumber() error = %v, want nil", err)
+	}
+	if got != 100 {
+		t.Errorf("BlockNumber() = %d, want %d", got, 100)
+	}
+	if got := recoveringCalls.Load(); got != 2 {
+		t.Errorf("recovering RPC calls = %d, want %d", got, 2)
+	}
+}
+
 func TestCloseStopsBackgroundBlockUpdater(t *testing.T) {
 	var calls atomic.Int64
 	rpc := newTestRPCServer(t, func(r *http.Request, method string) testRPCResult {
