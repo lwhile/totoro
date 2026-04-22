@@ -1,5 +1,9 @@
 # totoro
 
+[![CI](https://github.com/lwhile/totoro/actions/workflows/ci.yml/badge.svg)](https://github.com/lwhile/totoro/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/lwhile/totoro)](https://goreportcard.com/report/github.com/lwhile/totoro)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lwhile/totoro/badge)](https://scorecard.dev/viewer/?uri=github.com/lwhile/totoro)
+
 > [English](README.md) | [中文](README.zh-CN.md)
 
 `totoro` is a lightweight Go wrapper around `go-ethereum/ethclient` for EVM RPC reads and polling log subscriptions. It is designed for applications that depend on free or public RPC endpoints, where individual endpoints may fail, hang, lag behind, or be rate-limited.

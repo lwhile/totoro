@@ -1,5 +1,9 @@
 # totoro
 
+[![CI](https://github.com/lwhile/totoro/actions/workflows/ci.yml/badge.svg)](https://github.com/lwhile/totoro/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/lwhile/totoro)](https://goreportcard.com/report/github.com/lwhile/totoro)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lwhile/totoro/badge)](https://scorecard.dev/viewer/?uri=github.com/lwhile/totoro)
+
 > [English](README.md) | [中文](README.zh-CN.md)
 
 `totoro` 是一个围绕 `go-ethereum/ethclient` 的轻量级 Go 封装，用于 EVM RPC 读取和轮询式日志订阅。它适合依赖免费或公共 RPC 的应用，因为这些端点可能会失败、卡住、落后或被限流。
